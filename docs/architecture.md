@@ -1,278 +1,278 @@
-# 技能库工程方案 — 抓取 · 清洗 · 存储 · 检索 · 同步
+# Skill Catalog Engineering Plan — Fetch · Normalize · Store · Retrieve · Sync
 
-> 🌏 [English](architecture.en.md) | **中文**
+> 🌏 **English** | [中文](architecture.zh-CN.md)
 
-> 把海量第三方技能包做成「可语义检索、可装载」的技能库底座的完整工程方案。
-> 数据规模：~77,000 条 Claude Code 风格 SKILL.md 技能。
-
----
-
-## 1. 背景与目标
-
-**业务来源**：AI 员工 / Agent 产品要让 agent「能动手」，需要给它挂一层可检索、可装载的能力（tools / skills）。开源生态里已经有海量 Claude Code 风格的 `SKILL.md` 技能（一个技能 = 一段 frontmatter 元数据 + 一篇自然语言指令正文 + 可选 `scripts/` 脚本），是现成的能力供给池——本方案以某个公开、无鉴权的技能市场 REST API（约 77,000+ 条技能）为例。
-
-**目标**：把全量技能**抓下来、清洗规范化、入库（含语义检索）、并持续增量同步**，作为产品 runtime 的技能检索 / 装载底座。
-
-**「彻底版」定义**：单条技能在库内同时具备四态资产 ——
-
-1. **元数据**（21 字段：分类 / 下载量 / 版本 / 需 key 标识…）— 检索筛选用
-2. **body 正文**（`SKILL.md` 去 frontmatter）— 全文检索 + 喂 embedding
-3. **embedding 向量**（多模态 embedding，2048 维，pgvector）— 语义检索
-4. **完整 zip**（整目录含 `scripts/` `references/`，存对象存储）— 装载 / 分发用
-
-**验证期技术选型**：Supabase 一站式（Postgres + pgvector + Storage）。理由：pgvector 混合检索一站式、上手最快。生产 runtime 实时调用时再评估迁到自建 / 境内向量库。
+> A complete engineering plan for turning a massive collection of third-party skill packages into a "semantically searchable, loadable" skill-catalog foundation.
+> Data scale: ~77,000 Claude Code-style `SKILL.md` skills.
 
 ---
 
-## 2. 总体架构
+## 1. Background & Goals
 
-五层管线，每层产物落盘、幂等、可断点续跑。源头是公开 HTTP API，终点是 Postgres（结构化 + 向量 + 对象存储）。
+**Business origin**: AI-employee / agent products need their agents to "get hands-on," which requires attaching a retrievable, loadable capability layer (tools / skills). The open ecosystem already contains a massive supply of Claude Code-style `SKILL.md` skills (one skill = a block of frontmatter metadata + a body of natural-language instructions + optional `scripts/`), which form a ready-made capability pool. This plan uses a public, unauthenticated third-party skill-market REST API (~77,000+ skills) as a worked example.
+
+**Goal**: **fetch the full set, normalize it, load it into a database (including semantic search), and keep it incrementally synced** — serving as the skill retrieval / loading foundation for the product runtime.
+
+**Definition of the "full version"**: a single skill carries all four asset states in the catalog —
+
+1. **Metadata** (21 fields: category / downloads / version / requires-key flag, etc.) — used for retrieval filtering
+2. **Body text** (`SKILL.md` with frontmatter stripped) — full-text search + embedding input
+3. **Embedding vector** (multimodal embedding, 2048-dim, pgvector) — semantic search
+4. **Full zip** (the entire directory including `scripts/` and `references/`, stored in object storage) — used for loading / distribution
+
+**Tech choice for the validation phase**: Supabase all-in-one (Postgres + pgvector + Storage). Rationale: pgvector gives one-stop hybrid retrieval and is the fastest to get going. Migration to a self-hosted / domestic vector store will be re-evaluated when the production runtime makes real-time calls.
+
+---
+
+## 2. Overall Architecture
+
+A five-layer pipeline. Each layer persists its outputs, is idempotent, and is resumable from a checkpoint. The source is a public HTTP API; the destination is Postgres (structured data + vectors + object storage).
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  数据源：某公开技能市场 REST API（无鉴权）                                │
-│   GET /api/skills?page=&pageSize=100      列表元数据（含 version/需key） │
-│   GET /api/v1/download?slug=  → 302 zip(有包) / 404(无包)               │
-│   GET /api/v1/skillsets                   官方策展场景包                 │
+│  Data source: a public third-party skill-market REST API (no auth)     │
+│   GET /api/skills?page=&pageSize=100      list metadata (incl. version/requires-key) │
+│   GET /api/v1/download?slug=  → 302 zip (has package) / 404 (no package)│
+│   GET /api/v1/skillsets                   official curated scenario packs │
 └───────────────┬──────────────────────────────────────────────────────┘
                 │
-   ┌────────────▼─────────────┐  ① 抓取层 FETCH
-   │ fetch_all                 │   list→probe→build，多轮并集补抓+完整性校验
-   │ fetch_bodies              │   下载 zip 正文
-   │ extract                   │   解压 → all-skills/<slug>/
-   └────────────┬─────────────┘   产物：_full_raw.jsonl / all-skills/
+   ┌────────────▼─────────────┐  ① FETCH layer
+   │ fetch_all                 │   list→probe→build, multi-round union refetch + integrity check
+   │ fetch_bodies              │   download zip bodies
+   │ extract                   │   unzip → all-skills/<slug>/
+   └────────────┬─────────────┘   outputs: _full_raw.jsonl / all-skills/
                 │
-   ┌────────────▼─────────────┐  ② 清洗层 NORMALIZE（dry-run，不写库）
-   │ scan                      │   扫描判定 import|skip|review
-   │ validate_structure        │   5 硬条件过滤 → installable.tsv
-   │ import (映射)             │   字段映射 → skills.ndjson / versions.ndjson
-   │ package                   │   每技能独立 zip → catalog.ndjson（分发包）
+   ┌────────────▼─────────────┐  ② NORMALIZE layer (dry-run, no DB writes)
+   │ scan                      │   scan & classify import|skip|review
+   │ validate_structure        │   5 hard-condition filter → installable.tsv
+   │ import (mapping)          │   field mapping → skills.ndjson / versions.ndjson
+   │ package                   │   per-skill standalone zip → catalog.ndjson (distribution package)
    └────────────┬─────────────┘
                 │
-   ┌────────────▼─────────────┐  ③ 存储层 STORAGE（Postgres + pgvector + Storage）
-   │ schema.sql                │   skills + skill_versions 表
+   ┌────────────▼─────────────┐  ③ STORAGE layer (Postgres + pgvector + Storage)
+   │ schema.sql                │   skills + skill_versions tables
    │ enrich_schema.sql         │   body / embedding(vector 2048) / storage_path
-   │ import_to_db              │   元数据 upsert + 软删 + 版本表
-   │ embed_all                 │   embedding 全量灌入（64 并发，幂等续跑）
-   │ storage_all               │   整目录 zip 上传 Storage（64 并发，抗断连）
-   │ rls.sql                   │   上线前只读 RLS（anon/auth 只 select）
-   └────────────┬─────────────┘   终态：public.skills（4 态资产齐 + RLS）
+   │ import_to_db              │   metadata upsert + soft-delete + versions table
+   │ embed_all                 │   embed everything (64 concurrency, idempotent resume)
+   │ storage_all               │   zip whole dir, upload to Storage (64 concurrency, disconnect-resilient)
+   │ rls.sql                   │   read-only RLS before going live (anon/auth select only)
+   └────────────┬─────────────┘   final state: public.skills (all 4 asset states + RLS)
                 │
-   ┌────────────▼─────────────┐  ④ 检索层 RETRIEVAL
-   │ search                    │   query→embed→ embedding<=>qvec 余弦最近邻
+   ┌────────────▼─────────────┐  ④ RETRIEVAL layer
+   │ search                    │   query→embed→ embedding<=>qvec cosine nearest-neighbor
    └───────────────────────────┘
                 ▲
-   ┌────────────┴─────────────┐  ⑤ 更新层 SYNC（每周自动）
-   │ sync_diff                 │   diff 四态：new/updated/removed/stats_only
-   │ sync_weekly               │   抓新快照→diff→probe→报告→通知→滚基准
-   │ + 定时触发                │   每周一固定时刻本地触发
-   │ → import_to_db.sync_plan / enrich_slugs（增量回填）
+   ┌────────────┴─────────────┐  ⑤ SYNC layer (weekly, automatic)
+   │ sync_diff                 │   diff four states: new/updated/removed/stats_only
+   │ sync_weekly               │   fetch new snapshot→diff→probe→report→notify→roll baseline
+   │ + scheduled trigger       │   triggered locally at a fixed time every Monday
+   │ → import_to_db.sync_plan / enrich_slugs (incremental backfill)
    └───────────────────────────┘
 ```
 
-**技术约束（贯穿全链路）**：
+**Technical constraints (apply across the whole pipeline)**:
 
-- 后台跑 Python 必须带 `-u`，否则输出被 buffer，误判卡死。
-- 凭证从环境变量或本地 `.env` 读（环境变量优先），**绝不硬编码进脚本 / 仓库**。
+- Background Python **must** run with `-u`, otherwise output is buffered and the process is mistaken for hung.
+- Credentials are read from environment variables or a local `.env` (env vars take priority), and are **never hardcoded into scripts / the repo**.
 
 ---
 
-## 3. 数据源与 API
+## 3. Data Source & API
 
-实测三端点（公开、无鉴权）：
+Three endpoints, verified in practice (public, no auth):
 
-| 端点 | 用途 | 关键字段 / 行为 |
+| Endpoint | Purpose | Key fields / behavior |
 |---|---|---|
-| `GET /api/skills?page=N&pageSize=100` | 列表元数据 | `slug` / `category` / `description_zh` / `version` / `downloads` / `source` / `labels.requires_api_key`（字符串 `"true"`/`"false"`）/ `iconUrl`；pageSize 上限 100（>100 返 null） |
-| `GET /api/v1/download?slug=X` | 下载包 | 302→对象存储 zip（有包）/ 404（无包）。zip 内含 `SKILL.md` + `metadata.json` + `scripts/` |
-| `GET /api/v1/skillsets` | 官方场景包 | 仅少量策展场景，**非分类体系**；主分类只能用 `category` |
+| `GET /api/skills?page=N&pageSize=100` | List metadata | `slug` / `category` / `description_zh` / `version` / `downloads` / `source` / `labels.requires_api_key` (string `"true"`/`"false"`) / `iconUrl`; pageSize caps at 100 (>100 returns null) |
+| `GET /api/v1/download?slug=X` | Download package | 302→object-storage zip (has package) / 404 (no package). The zip contains `SKILL.md` + `metadata.json` + `scripts/` |
+| `GET /api/v1/skillsets` | Official scenario packs | Only a small curated set of scenarios, **not a taxonomy**; the primary categorization can only use `category` |
 
-**API 现实坑（已坐实）**：
+**Real-world API pitfalls (confirmed)**:
 
-- **分页不稳定**：同一时刻三次抓取返回数量波动 ±1000+。单轮抓必然漏 → 必须多轮并集（见 §4.1）。
-- **`updated_at` 是脏信号**：跟随 downloads 每次同步刷新，无法区分「内容更新」vs「下载量涨」。**变更信号只认 `version`**（见 §8.1）。
-- **`requires_api_key`** 在原始 `labels` 里是字符串 `"true"`，本地需规范成 bool。
+- **Unstable pagination**: three fetches at the same instant return counts that swing by ±1000+. A single-round fetch is guaranteed to miss data → multi-round union is mandatory (see §4.1).
+- **`updated_at` is a dirty signal**: it is refreshed on every sync along with downloads, so it cannot distinguish "content update" vs. "download count went up." **The only trusted change signal is `version`** (see §8.1).
+- **`requires_api_key`** is the string `"true"` in the raw `labels`, and must be normalized to a bool locally.
 
 ---
 
-## 4. ① 抓取层 FETCH
+## 4. ① FETCH Layer
 
-三阶段（可分跑、幂等、断点续抓）：
+Three stages (independently runnable, idempotent, resumable):
 
 ```
-list   抓全量列表元数据 → _full_raw.jsonl + 分布统计
-probe  逐条探 download(302有包/404无包) → 写回 _full_raw.jsonl 的 has_package
-build  按「不需key + 有包」筛 → 研发可直接用的精选集
+list   fetch the full list metadata → _full_raw.jsonl + distribution stats
+probe  probe download per skill (302 has package / 404 none) → write back has_package into _full_raw.jsonl
+build  filter by "no key needed + has package" → a curated set developers can use directly
 ```
 
-### 4.1 抓取健壮性设计（核心难点 = 对抗 API 分页抖动）
+### 4.1 Fetch robustness design (the core challenge = fighting API pagination jitter)
 
-多层防御：
+Multiple layers of defense:
 
-1. **失败页重试 ×3 轮**：单页失败不丢，重试 3 轮。
-2. **多轮并集补抓**：整轮抓完取 slug 并集，若未达 total 的 99.5% → 整轮重抓并入并集，直到收敛。
-3. **完整性校验闸门**：最终 < total 的 98% → 抛错，**不写残缺快照**（残缺快照绝不能滚成基准）。
+1. **Retry failed pages ×3 rounds**: a single failed page is not dropped — retried over 3 rounds.
+2. **Multi-round union refetch**: after a full round, take the union of slugs; if it has not reached 99.5% of `total`, refetch the whole round and merge into the union, until it converges.
+3. **Integrity-check gate**: if the final count is < 98% of `total` → raise an error and **do not write a partial snapshot** (a partial snapshot must never be rolled into the baseline).
 
-> 效果：下架噪音从上万（残缺误报）收敛到几十（≈ 0.06%，是 API 固有波动，运维可接受）。
+> Effect: removal noise dropped from tens of thousands (partial-snapshot false positives) down to a few dozen (≈ 0.06%, inherent API jitter, acceptable for ops).
 
-### 4.2 下载与解压
+### 4.2 Download & Extract
 
-- 下载 zip 正文（下载不需 key，仅运行时需）。
-- 解压 → `all-skills/<slug>/`（含 `metadata.json` + `SKILL.md` + `scripts/`）。
-
----
-
-## 5. ② 清洗层 NORMALIZE
-
-四脚本流水，全 dry-run（产报告，不写库），同快照重跑逐字节一致。
-
-| 阶段 | 输入 | 产物 | 职责 |
-|---|---|---|---|
-| scan | `all-skills/` | `manifest.json` | 扫描判定 `import\|skip\|review`；`metadata.json` = 唯一可信主键源 |
-| validate | `manifest.json` | `installable.tsv` | 5 硬条件过滤 |
-| import | `installable.tsv` | `skills.ndjson` / `versions.ndjson` | 字段映射（含 body 全文） |
-| package | `installable.tsv` | `catalog.ndjson` + `packages/<slug>.zip` | 每技能独立分发包 |
-
-**5 条硬过滤条件**（能否被 Claude Code 装载）：
-
-1. `metadata.json` 可解析且含 slug
-2. 有且能消歧出唯一 `SKILL.md`
-3. 合法 YAML frontmatter
-4. 非空 `name`
-5. 非空 `description`
-
-**消歧（多 SKILL.md）**：优先根 `./SKILL.md`，否则按 `(depth, 字典序)` 取首个。
-
-**结果**：约 5.4 万原始 → 约 4.8 万合规（过滤约 6500：无 frontmatter / 无 SKILL.md / 无 desc / 无 name）。
-
-### 5.1 三字段口径（对治研发误报）
-
-| 字段 | 含义 | 来源 | 校验 |
-|---|---|---|---|
-| `slug` | 平台主键 / 去重 / diff | API（全局唯一） | — |
-| `display_name` | 展示给用户 | `metadata.name`（空 / == slug 时用 `description_zh` 首句 → slug 兜底） | — |
-| `_skill_name` | 装 Claude Code 当 skill 用的标识符 | `SKILL.md` frontmatter `name` | **不校验 == slug**（本就不同维度） |
-
-> 研发曾误报 `name does not match slug`、`Expected exactly one SKILL.md`——全是校验过严的非数据缺陷。`slug`（平台主键）和 `frontmatter.name`（技能装载标识符）本就是不同维度，不该相互校验。
+- Download the zip bodies (download needs no key; only runtime does).
+- Unzip → `all-skills/<slug>/` (contains `metadata.json` + `SKILL.md` + `scripts/`).
 
 ---
 
-## 6. ③ 存储层 STORAGE（Postgres + pgvector + Storage）
+## 5. ② NORMALIZE Layer
 
-### 6.1 表结构
+A four-script pipeline, fully dry-run (produces reports, no DB writes); rerunning on the same snapshot is byte-for-byte identical.
 
-元数据双表：
+| Stage | Input | Output | Responsibility |
+|---|---|---|---|
+| scan | `all-skills/` | `manifest.json` | Scan & classify `import\|skip\|review`; `metadata.json` = the only trusted primary-key source |
+| validate | `manifest.json` | `installable.tsv` | 5 hard-condition filter |
+| import | `installable.tsv` | `skills.ndjson` / `versions.ndjson` | Field mapping (incl. full body text) |
+| package | `installable.tsv` | `catalog.ndjson` + `packages/<slug>.zip` | Per-skill standalone distribution package |
+
+**The 5 hard filter conditions** (can it be loaded by Claude Code):
+
+1. `metadata.json` parses and contains a slug
+2. There is exactly one disambiguatable `SKILL.md`
+3. Valid YAML frontmatter
+4. Non-empty `name`
+5. Non-empty `description`
+
+**Disambiguation (multiple SKILL.md)**: prefer the root `./SKILL.md`; otherwise take the first by `(depth, lexicographic order)`.
+
+**Result**: ~54k raw → ~48k compliant (~6500 filtered out: no frontmatter / no SKILL.md / no desc / no name).
+
+### 5.1 The three-field convention (to counter developer false positives)
+
+| Field | Meaning | Source | Validation |
+|---|---|---|---|
+| `slug` | Platform primary key / dedup / diff | API (globally unique) | — |
+| `display_name` | Shown to users | `metadata.name` (when empty / == slug, fall back to the first sentence of `description_zh` → then slug) | — |
+| `_skill_name` | The identifier used when loading into Claude Code as a skill | `SKILL.md` frontmatter `name` | **Not validated to == slug** (different dimension by design) |
+
+> Developers once raised false alarms like `name does not match slug` and `Expected exactly one SKILL.md` — all of them stemmed from over-strict validation, not data defects. `slug` (the platform primary key) and `frontmatter.name` (the skill-loading identifier) are different dimensions by design and should not be cross-validated.
+
+---
+
+## 6. ③ STORAGE Layer (Postgres + pgvector + Storage)
+
+### 6.1 Schema
+
+Metadata across two tables:
 
 ```sql
 public.skills(
   slug PK, title, description, description_zh, category, tags(jsonb),
   downloads, installs, stars,
-  version,                  -- 更新信号（diff 认 version 不认 updated_at）
+  version,                  -- update signal (diff trusts version, not updated_at)
   source, author,
-  requires_api_key bool,    -- 进哪个分发包
-  has_package bool,         -- probe 结果
+  requires_api_key bool,    -- which distribution package it goes into
+  has_package bool,         -- probe result
   icon_url, homepage,
-  is_active bool default true,   -- 软删：下架=false（不物删）
+  is_active bool default true,   -- soft-delete: removed = false (no physical delete)
   first_seen_at, updated_at
-)  -- + 索引: category / req_key / is_active / downloads desc
+)  -- + indexes: category / req_key / is_active / downloads desc
 
 public.skill_versions(
   id bigserial PK, slug FK→skills, version, seen_at,
-  unique(slug, version)     -- updated 态追加新版本，留版本史
+  unique(slug, version)     -- the updated state appends a new version, keeping version history
 )
 ```
 
-彻底版增列：
+Columns added for the full version:
 
 ```sql
 create extension if not exists vector;
 alter table public.skills
-  add column body         text,          -- SKILL.md 正文
-  add column embedding    vector(2048),  -- 多模态 embedding 维度
+  add column body         text,          -- SKILL.md body
+  add column embedding    vector(2048),  -- multimodal embedding dimension
   add column storage_path text,          -- skills/<slug>.zip
   add column enriched_at  timestamptz;
 ```
 
-> ⚠️ **向量索引方案（实战修正，原 `hnsw (embedding vector_cosine_ops)` 作废）**：
+> ⚠️ **Vector index approach (corrected in practice; the original `hnsw (embedding vector_cosine_ops)` is dropped)**:
 >
-> - **2048 维超 pgvector HNSW/IVFFlat 全精度 `vector` 上限 2000** → 必须用 **`halfvec` 半精度**（上限 4000，精度损失对排序基本无感）。
-> - 实际采用 **IVFFlat over halfvec 表达式索引**（HNSW 在小实例上建索引耗内存更高、更易被掐）：
+> - **2048 dimensions exceeds pgvector's full-precision `vector` limit of 2000 for HNSW/IVFFlat** → you must use **`halfvec` half-precision** (limit 4000; the precision loss is essentially imperceptible for ranking).
+> - In practice we use an **IVFFlat-over-halfvec expression index** (HNSW consumes more memory to build on a small instance and is more easily killed):
 >
 > ```sql
 > set statement_timeout = '30min';
-> set max_parallel_maintenance_workers = 0;   -- 串行，避开并行 worker 在 /dev/shm 开段 DiskFull
+> set max_parallel_maintenance_workers = 0;   -- serial, to avoid parallel workers opening segments in /dev/shm and hitting DiskFull
 > create index idx_skills_embedding_ivf on public.skills
 >   using ivfflat ((embedding::halfvec(2048)) halfvec_cosine_ops) with (lists = 200);
 > ```
 >
-> - 🔴 **建索引必须在数据库托管控制台的 SQL Editor 里跑（服务端执行）**，**不能从本地长连接建**——本地代理（如 Clash，DB 连到 fake-IP）会按时长砍多分钟空闲长连接（`SSL SYSCALL error: EOF detected`，keepalive 无效；服务端日志无 OOM/FATAL 可证非服务端问题）。灌数据 / 查询有数据流能活，纯等待几分钟的建索引必死。详见 [engineering-notes.md](engineering-notes.md)。
+> - 🔴 **The index must be built in the managed database console's SQL Editor (server-side execution)**, **not from a local long-lived connection** — a local network proxy (e.g. Clash, where the DB resolves to a fake-IP) will cut multi-minute idle long-lived connections by duration (`SSL SYSCALL error: EOF detected`; keepalive is ineffective; the absence of OOM/FATAL in server-side logs proves it is not a server-side problem). Loading data / querying have a data stream and stay alive; building an index that just waits for several minutes is doomed. See [engineering-notes.md](engineering-notes.md).
 
-### 6.2 元数据入库
+### 6.2 Metadata Ingestion
 
-- 读基准快照 → 清洗（递归去 NUL `0x00`，PG text/jsonb 拒收）→ 批量 upsert（5000/批）+ `skill_versions`。
-- 连接走 **Session pooler**（IPv4 免费代理）。
-- 提供 `sync_plan(plan, new, enrich=False)` 给 sync 层做四态增量（见 §8.3）。
+- Read the baseline snapshot → clean (recursively strip NUL `0x00`, which PG text/jsonb rejects) → batch upsert (5000/batch) + `skill_versions`.
+- Connect via the **Session pooler** (free IPv4 proxy).
+- Provide `sync_plan(plan, new, enrich=False)` for the sync layer to do four-state incremental updates (see §8.3).
 
-**`connect()` 加固** —— 批量写库（storage/enrich/upsert）在负载下反复死，三件套修：
+**`connect()` hardening** — batch DB writes (storage/enrich/upsert) repeatedly died under load; a three-part fix:
 
 ```python
-# 每个连接建立后立即 SET（Session pooler 会话内持续）
-set statement_timeout = '10min'   # 防 256 行批量 UPDATE 撞 DB 默认超时被取消；不设 0（0 会让撞锁 UPDATE 无限挂）
-set lock_timeout      = '30s'     # 撞残留行锁快速失败，不挂死
-# + TCP keepalive(keepalives_idle=10s)：撑过 embed/上传几十秒网络间隙，防代理砍空闲连接
+# SET immediately after each connection is established (persists within the Session-pooler session)
+set statement_timeout = '10min'   # prevents 256-row batch UPDATEs from being canceled by the DB default timeout; don't set 0 (0 makes a lock-colliding UPDATE hang forever)
+set lock_timeout      = '30s'     # fail fast on leftover row locks instead of hanging
+# + TCP keepalive (keepalives_idle=10s): survives the tens-of-seconds network gaps during embed/upload, preventing the proxy from cutting idle connections
 ```
 
-> 索引构建（分钟级）仍走 SQL Editor 服务端，不经此路径（见 §6.1 注）。
+> Index building (minutes-scale) still runs server-side in the SQL Editor and does not go through this path (see the §6.1 note).
 
-### 6.3 Embedding 灌入
+### 6.3 Embedding Ingestion
 
-**多模态 embedding 的硬约束（踩坑结晶）**：
+**Hard constraints of the multimodal embedding (crystallized from the pitfalls)**:
 
-- ⚠️ **model 名直调 404 → 必须建推理接入点用 endpoint-id**（占位 `${EMBED_MODEL}`）。
-- 端点 `/api/v3/embeddings/multimodal`，input = `[{type:text, text}]`，**多模态一次融合成 1 向量 → 每条单请求，不能批量塞多文本**。
-- 维度 **2048**。
+- ⚠️ **Calling the model name directly returns 404 → you must create an inference endpoint and use its endpoint-id** (placeholder `${EMBED_MODEL}`).
+- The endpoint `/api/v3/embeddings/multimodal`, with input = `[{type:text, text}]`, **fuses everything into 1 vector per call → one request per skill; you cannot batch multiple texts into one call**.
+- Dimension **2048**.
 
-脚本设计：
+Script design:
 
-1. DB 只查 `embedding is null and body is not null` 的 slug（**不拉大 body 字段**，避免 statement 超时）。
-2. body 本地读 → 64 并发 embed → 批量 `update ... from (values %s) v(slug,emb) where s.slug=v.slug`，每 256 条 commit。
-3. **幂等续跑**：只处理 null，失败 slug 跳过不阻塞。崩溃后重跑自动续灌。
-4. **尾巴补灌**：本地缺 body 但 DB 有 body 的，单独从 DB body 读、同口径 embed 补上。
+1. The DB only queries slugs where `embedding is null and body is not null` (**do not pull the large body field**, to avoid statement timeouts).
+2. Read body locally → embed at 64 concurrency → batch `update ... from (values %s) v(slug,emb) where s.slug=v.slug`, committing every 256 rows.
+3. **Idempotent resume**: only process nulls; skip failed slugs without blocking. After a crash, a rerun automatically resumes ingestion.
+4. **Tail backfill**: for rows missing a local body but having a body in the DB, read the body from the DB and embed it with the same convention to fill it in.
 
-> 灌完建索引：见 §6.1 注 —— **halfvec + IVFFlat，且必须在 SQL Editor 服务端跑**。
-> **实测结果**：约 7.5 万条 embedding（全部有 body 的行），IVFFlat 索引建成。
+> After ingestion, build the index: see the §6.1 note — **halfvec + IVFFlat, and it must run server-side in the SQL Editor**.
+> **Measured result**: ~75k embeddings (all rows that have a body), with the IVFFlat index built.
 
-### 6.4 Storage 上传（加速 + 抗断连）
+### 6.4 Storage Upload (acceleration + disconnect resilience)
 
-对治串行瓶颈（7.5 万串行 PUT 要数小时）：
+To counter the serial bottleneck (75k serial PUTs would take hours):
 
-1. DB 查 `storage_path is null` 的 slug → 本地整目录打内存 zip。
-2. 64 并发上传到对象存储（header 必带 `apikey` + `Authorization: Bearer <service_key>` + `x-upsert:true`，缺 apikey → 400）。
-3. 批量 update `storage_path`，无本地目录的 slug 自动跳过。
+1. The DB queries slugs where `storage_path is null` → zip the whole local directory in memory.
+2. Upload at 64 concurrency to object storage (headers must carry `apikey` + `Authorization: Bearer <service_key>` + `x-upsert:true`; missing apikey → 400).
+3. Batch-update `storage_path`; slugs with no local directory are automatically skipped.
 
-**bucket** 私有。**写权限**：必须 service_role / secret key（anon 不行）。
+**bucket** is private. **Write permission**: must be service_role / secret key (anon won't work).
 
-**⭐ 抗断连关键重构：上传期不持 DB 连接**
+**⭐ Key disconnect-resilience refactor: hold no DB connection during upload**
 
-原版持一个长命 DB 连接贯穿整个上传循环 → 在每 chunk 几十秒的上传网络间隙里连接空闲，被本地代理砍掉（`SSL SYSCALL error: EOF detected`），随后 `conn.rollback()` 在死连接上又抛 `InterfaceError` 把整个 job 带崩。重构成 **`db_once(fn)`**：
+The original version held one long-lived DB connection across the entire upload loop → during each chunk's tens-of-seconds upload network gap the connection went idle and was cut by the local proxy (`SSL SYSCALL error: EOF detected`); then `conn.rollback()` on the dead connection raised `InterfaceError` and brought the whole job down. Refactored into **`db_once(fn)`**:
 
-- 上传阶段（`ThreadPoolExecutor` 并发 PUT）**完全不持 DB 连接**。
-- 每 chunk 上传完，才临时开连接做 UPDATE → commit → **立即关**；**连接只活几秒，永不空闲 → 代理砍不到**。
-- 对连接死亡（SSL EOF / InterfaceError / OperationalError）**重连重试 4 次**（指数退避）；重试仍失败才留 null，下轮幂等补记。
+- The upload phase (concurrent PUTs via `ThreadPoolExecutor`) **holds no DB connection at all**.
+- Only after a chunk finishes uploading does it briefly open a connection to do the UPDATE → commit → **close immediately**; **the connection lives only a few seconds and is never idle → the proxy can't catch it**.
+- On connection death (SSL EOF / InterfaceError / OperationalError), **reconnect and retry 4 times** (exponential backoff); only if retries still fail is the value left null, to be idempotently backfilled next round.
 
-> 通用原则：**本地批量写库别持长命连接**，要么临时连接，要么 §6.2 的 keepalive + 有限 timeout。
+> General principle: **don't hold a long-lived connection for local batch DB writes** — use either ephemeral connections, or the §6.2 keepalive + bounded timeout.
 
-**完成实测**：重构版扛住代理断连一口气跑完，`storage_path` 非空约 7.5 万（剩约 2000 = 本地无包的尾巴，需先下载入库才能补）。
+**Measured completion**: the refactored version withstood proxy disconnects and ran through in one pass; non-empty `storage_path` is ~75k (the remaining ~2000 = the tail with no local package, which needs to be downloaded and ingested first before it can be filled in).
 
 ---
 
-## 7. ④ 检索层 RETRIEVAL
+## 7. ④ RETRIEVAL Layer
 
-检索 SQL（query 与库内向量同口径、走 IVFFlat halfvec 索引）：
+Retrieval SQL (the query uses the same convention as the in-catalog vectors and hits the IVFFlat halfvec index):
 
 ```sql
-set ivfflat.probes = 10;   -- 越大越准越慢
--- qvec = embed(query) 得到 2048 维向量
+set ivfflat.probes = 10;   -- larger = more accurate but slower
+-- qvec = embed(query) yields a 2048-dim vector
 select slug, title,
        (embedding::halfvec(2048) <=> :qvec::halfvec(2048)) as dist
 from public.skills
@@ -281,64 +281,64 @@ order by embedding::halfvec(2048) <=> :qvec::halfvec(2048)
 limit k;
 ```
 
-- 用同一个 embed 函数保证 query 向量与库内向量在**同一空间**（关键正确性）。
-- **两侧都 cast `::halfvec(2048)`** 才能命中 IVFFlat halfvec 表达式索引（与建索引表达式一致）。
-- **实测（约 7.5 万条）**：带索引 `probes=10` **~500ms/查询**（无索引精确扫描 **130s** → 提速 ~260×）；结果高相关——外呼营销 → 客户跟进 / 客服话术；数据整理 → 数据报告生成器；客户投诉 → 电商售后回复。
-- 内置一组中文场景查询做冒烟。
+- Use the same embed function so the query vector and the in-catalog vectors live in the **same space** (critical for correctness).
+- **Cast `::halfvec(2048)` on both sides** to hit the IVFFlat halfvec expression index (matching the index-build expression).
+- **Measured (~75k rows)**: with the index and `probes=10`, **~500ms/query** (an exact scan without the index is **130s** → ~260× speedup); results are highly relevant — outbound marketing → customer follow-up / customer-service scripts; data wrangling → data-report generator; customer complaint → e-commerce after-sales reply.
+- Ships with a set of Chinese-scenario queries as a smoke test.
 
 ---
 
-## 8. ⑤ 更新层 SYNC（每周自动 · 检测 + 通知）
+## 8. ⑤ SYNC Layer (weekly, automatic · detect + notify)
 
-设计成「只检测 + 通知」层（不下载 / 不入库 / 不重打，入库人工触发）+ 本地定时 + 每周 + IM 通知。
+Designed as a "detect + notify only" layer (no download / no ingestion / no repackaging; ingestion is manually triggered) + local scheduling + weekly + IM notification.
 
-### 8.1 增量 diff
+### 8.1 Incremental diff
 
-按 slug 主键 diff 新旧 catalog，四态：
+Diff the old vs. new catalog by the slug primary key, four states:
 
-| 态 | 判定 | 动作 |
+| State | Decision | Action |
 |---|---|---|
-| `new` | slug 新增且有包 | 下载入库 |
-| `updated` | **version 变** | 重下 + 追加 `skill_versions` |
-| `removed` | slug 消失 | 软删 `is_active=false`（不物删） |
-| `stats_only` | 仅 downloads/stars 变 | 只更新统计列（免下载） |
+| `new` | slug added and has a package | download + ingest |
+| `updated` | **version changed** | re-download + append to `skill_versions` |
+| `removed` | slug disappeared | soft-delete `is_active=false` (no physical delete) |
+| `stats_only` | only downloads/stars changed | update only the stats columns (no download) |
 
-> selftest 内置 mock 四态回归（含「updated_at 变但 version 不变 + downloads 变 → 必判 stats_only」守坑 case）。
+> The selftest includes a mock four-state regression (including the guard case "updated_at changed but version unchanged + downloads changed → must be judged stats_only").
 
-### 8.2 周度调度
+### 8.2 Weekly schedule
 
 ```
-抓新快照 → diff(baseline, new) → 对新增 slug 补 probe
-→ 生成报告 → IM 通知（发给运维 owner）
-→ 滚动基准（_baseline.jsonl 覆盖，旧的归档 snapshots/）
+fetch new snapshot → diff(baseline, new) → probe the newly added slugs
+→ generate report → IM notify (sent to the ops owner)
+→ roll the baseline (overwrite _baseline.jsonl, archive the old one to snapshots/)
 ```
 
-- **触发**：本地定时器，每周固定时刻。
-- **双闸门防污染**：新快照 < 基准 95% → 中止、不滚基准、发告警（已两次回滚验证）。
-- **运维自通知不走对外触达闸口**：对外触达（给客户发消息）必须经人工确认闸口；运维自通知发给 owner 本人，走对外闸口就不「自动」了。
+- **Trigger**: a local scheduler, at a fixed time every week.
+- **Dual gate against contamination**: if the new snapshot is < 95% of the baseline → abort, do not roll the baseline, and send an alert (validated by two rollbacks already).
+- **Ops self-notification does not go through the outbound-contact gate**: outbound contact (sending messages to customers) must pass a human-confirmation gate; ops self-notifications go to the owner themselves — routing them through the outbound gate would defeat being "automatic."
 
-### 8.3 sync → DB 自动回填（含内容层 enrich）
+### 8.3 sync → DB auto-backfill (incl. content-layer enrich)
 
-sync 报告后调 `sync_plan(plan, new, enrich=False)`：
+After the sync report, it calls `sync_plan(plan, new, enrich=False)`:
 
-- **元数据层（默认）**：new/updated → upsert(+versions)、removed → 软删、stats_only 默认不写（量大）。失败不阻塞报告 / 通知。
-- **内容层（`enrich=True` 时）**：upsert 完对 new/updated 中**本地已存在**的 slug 回填 body/向量/Storage 包；**缺本地包的安全跳过**（内容层依赖本地包，须先人工「入库」下载解压）。整段 try/except 包住，回填失败只记日志不阻塞。
+- **Metadata layer (default)**: new/updated → upsert (+versions), removed → soft-delete, stats_only is not written by default (too high-volume). Failures do not block the report / notification.
+- **Content layer (when `enrich=True`)**: after upsert, backfill body/vector/Storage package for the slugs among new/updated that **already exist locally**; slugs **missing a local package are safely skipped** (the content layer depends on the local package, which must first be manually "ingested" — downloaded and extracted). The whole block is wrapped in try/except; a backfill failure only logs and does not block.
 
-> 每周自动 sync 仍只发 `enrich=False`（新增 slug 此刻无本地包、enrich 无意义）。内容层回填走人工「入库」路径：下载 zip → 解压 → `sync_plan(plan, new, enrich=True)`。
+> The weekly automatic sync still only sends `enrich=False` (newly added slugs have no local package at that moment, so enrich is meaningless). Content-layer backfill goes through the manual "ingest" path: download zip → extract → `sync_plan(plan, new, enrich=True)`.
 
 ---
 
-## 9. 运维 · 成本 · 安全
+## 9. Ops · Cost · Security
 
-**成本**（参考量级）：托管 Postgres Pro 档约 $25/mo + embedding 首灌一次性约几十到一百多元（batch 折扣）+ 每周增量约 ¥10/mo。
+**Cost** (ballpark): managed Postgres Pro tier ~$25/mo + a one-time embedding first-load of roughly tens to a bit over a hundred RMB (batch discount) + weekly increments ~¥10/mo.
 
-**安全**：
+**Security**:
 
-- 凭证从环境变量 / `.env` 读，**绝不硬编码进仓库**；上线前轮换。
-- **RLS 只读**：`skills` + `skill_versions` 各 `enable row level security` + `revoke insert/update/delete from anon,authenticated` + `grant select` + 只读 select policy（`using(is_active)` → 软删技能对公开读不可见）。**写仅限 service_role / postgres**（二者 BYPASSRLS，sync/enrich/storage 管线不受影响）。
-- bucket 私有，访问走 service key 或签名 URL。
+- Credentials are read from environment variables / `.env`, and are **never hardcoded into the repo**; rotate before going live.
+- **Read-only RLS**: `skills` + `skill_versions` each `enable row level security` + `revoke insert/update/delete from anon,authenticated` + `grant select` + a read-only select policy (`using(is_active)` → soft-deleted skills are invisible to public reads). **Writes are limited to service_role / postgres** (both are BYPASSRLS, so the sync/enrich/storage pipeline is unaffected).
+- The bucket is private; access goes through a service key or signed URLs.
 
-**必备凭证**（填本地 `.env`，占位）：
+**Required credentials** (filled into a local `.env`, placeholders):
 
 ```
 DB_URL=<postgres-connection-string>
@@ -350,10 +350,10 @@ EMBED_MODEL=<embedding-endpoint-id>
 
 ---
 
-## 附录：字段字典
+## Appendix: Field Dictionary
 
-抓取 → 清洗 → 落库的三套字段口径见 [field-dictionary.md](field-dictionary.md)。
+For the three field conventions across fetch → normalize → load, see [field-dictionary.md](field-dictionary.md).
 
-## 附录：工程结晶
+## Appendix: Engineering Crystallizations
 
-把全链路踩过的坑整理成的复盘见 [engineering-notes.md](engineering-notes.md) ——本方案最高价值的部分。
+For the retrospective compiling every pitfall hit across the whole pipeline, see [engineering-notes.md](engineering-notes.md) — the highest-value part of this plan.

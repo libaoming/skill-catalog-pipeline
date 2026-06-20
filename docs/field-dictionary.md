@@ -1,113 +1,113 @@
-# 字段字典 — 抓取 → 清洗 → 落库 全链路
+# Field Dictionary — Fetch → Clean → Persist, End to End
 
-> 🌏 [English](field-dictionary.en.md) | **中文**
+> 🌏 **English** | [中文](field-dictionary.zh-CN.md)
 
-字段在三个阶段有三套口径。理解这三套口径的差异，是对治「研发误报字段不匹配」的关键。
-
----
-
-## A.1 API 原始字段（① 抓取层拿到的）
-
-`_full_raw.jsonl` 每行（列表单条 + probe 回写）：
-
-| 字段 | 含义 | 备注 |
-|---|---|---|
-| `slug` | 唯一标识（下载 / 安装 / diff 主键） | 全局唯一 |
-| `name` | 展示名 | 可中文 |
-| `category` | 平台大类 | 约 70% 为空（精选层仅约 10% 空） |
-| `description_zh` / `description` | 中文 / 英文描述 | 中文 ≈99% 有；英文常空 |
-| `downloads` / `installs` / `stars` | 热度 | 平台自报，无第三方校验；`verified` 字段全 0 不可用 |
-| `version` | 版本 | **唯一可信变更信号**（diff 认它不认 `updated_at`） |
-| `source` | 来源（社区 / 企业等） | — |
-| `author` / `ownerName` | 作者 | — |
-| `labels.requires_api_key` | 是否需外部 key | **原始是字符串 `"true"`/`"false"`** |
-| `iconUrl` / `homepage` | 图标 / 详情页 | — |
-| `updated_at` | 更新时间 | ⚠️ **脏信号**：随 downloads 刷新，不可作变更依据 |
-| `has_package` / `_probe_code` | probe 探测结果 | 302/200 = 有包，404 = 无包 |
+Fields have three different sets of conventions across three stages. Understanding the differences between these three conventions is the key to curing "false reports of field mismatch during development."
 
 ---
 
-## A.2 清洗 NDJSON 字段（② 清洗层 `skills.ndjson` 每行 + fallback 链）
+## A.1 Raw API Fields (① obtained by the fetch layer)
 
-只读 `metadata.json`（主源）+ `SKILL.md`（正文）。
+Each line of `_full_raw.jsonl` (one list entry + probe write-back):
 
-| NDJSON 字段 | 来源 / fallback 链 | 释义 |
+| Field | Meaning | Notes |
 |---|---|---|
-| `slug` | `metadata.slug` | 主键 |
-| `title` | `metadata.name` → `fm.name` → `slug` | 显示名 |
-| `description` | `description_zh` ‖ `description` ‖ `fm.description` | fallback 后的展示描述 |
-| `description_zh` / `description_en` | metadata（原值） | 中 / 英描述原值 |
-| `category` | `metadata.category` | 平台大类（常空） |
-| `tags` | `metadata.tags` | 标签数组 |
-| `downloads` / `installs` / `stars` | metadata | 热度 |
-| `version` | `metadata.version` | 喂 SkillVersion |
+| `slug` | Unique identifier (primary key for download / install / diff) | Globally unique |
+| `name` | Display name | May be in Chinese |
+| `category` | Platform top-level category | ~70% empty (only ~10% empty in the curated tier) |
+| `description_zh` / `description` | Chinese / English description | Chinese present ≈99%; English often empty |
+| `downloads` / `installs` / `stars` | Popularity | Self-reported by the platform, no third-party verification; the `verified` field is all 0 and unusable |
+| `version` | Version | **The only trustworthy change signal** (diff trusts it, not `updated_at`) |
+| `source` | Origin (community / enterprise, etc.) | — |
+| `author` / `ownerName` | Author | — |
+| `labels.requires_api_key` | Whether an external key is required | **Raw value is the string `"true"`/`"false"`** |
+| `iconUrl` / `homepage` | Icon / detail page | — |
+| `updated_at` | Update time | ⚠️ **Dirty signal**: refreshed alongside downloads, cannot be used as a basis for change |
+| `has_package` / `_probe_code` | probe detection result | 302/200 = has a package, 404 = no package |
+
+---
+
+## A.2 Cleaned NDJSON Fields (② each line of the cleaning layer's `skills.ndjson` + fallback chain)
+
+Reads only `metadata.json` (primary source) + `SKILL.md` (body).
+
+| NDJSON Field | Source / fallback chain | Definition |
+|---|---|---|
+| `slug` | `metadata.slug` | Primary key |
+| `title` | `metadata.name` → `fm.name` → `slug` | Display name |
+| `description` | `description_zh` ‖ `description` ‖ `fm.description` | Display description after fallback |
+| `description_zh` / `description_en` | metadata (raw values) | Raw Chinese / English description values |
+| `category` | `metadata.category` | Platform top-level category (often empty) |
+| `tags` | `metadata.tags` | Array of tags |
+| `downloads` / `installs` / `stars` | metadata | Popularity |
+| `version` | `metadata.version` | Feeds SkillVersion |
 | `source` / `author` | metadata | — |
-| `requires_api_key` | metadata（已规范 bool） | 判是否可直连 |
+| `requires_api_key` | metadata (already normalized to bool) | Determines whether a direct connection is possible |
 | `icon_url` / `homepage` | metadata | — |
-| `fm_name` | `SKILL.md` frontmatter `name` | 技能 id / 触发名（`_skill_name`） |
-| `fm_description` | `SKILL.md` frontmatter `description` | 触发 / 检索依据 |
-| `skill_md_path` | 扫描派生 | 消歧后 `SKILL.md` 相对路径（溯源） |
-| `warnings` | 校验派生 | 软警告（逗号分隔） |
-| `body` | `SKILL.md` 去 frontmatter 全文 | 全文 + 喂 embedding |
+| `fm_name` | `SKILL.md` frontmatter `name` | Skill id / trigger name (`_skill_name`) |
+| `fm_description` | `SKILL.md` frontmatter `description` | Trigger / retrieval basis |
+| `skill_md_path` | Derived from scan | Relative path of the disambiguated `SKILL.md` (provenance) |
+| `warnings` | Derived from validation | Soft warnings (comma-separated) |
+| `body` | `SKILL.md` full text minus frontmatter | Full text + feeds embedding |
 
-> **三字段口径（关键，对治研发误报）**：
-> - `slug` = 平台主键（去重 / diff）
-> - `title` / `display_name` = 展示名（`metadata.name`）
-> - `fm_name` / `_skill_name` = 装 Claude Code 的标识符（`SKILL.md` frontmatter `name`）
+> **The three-field convention (critical, cures false reports during development)**:
+> - `slug` = platform primary key (dedup / diff)
+> - `title` / `display_name` = display name (`metadata.name`)
+> - `fm_name` / `_skill_name` = the identifier for installing into Claude Code (`SKILL.md` frontmatter `name`)
 >
-> 后两者**与 `slug` 本就不同维度，不校验相等**。曾有研发误报「name does not match slug」「Expected exactly one SKILL.md」——全是校验过严，非数据缺陷。
+> The latter two are **inherently a different dimension from `slug` and are not validated for equality**. There were once false reports during development — "name does not match slug" and "Expected exactly one SKILL.md" — all of which were over-strict validation, not data defects.
 
 ---
 
-## A.3 DB 落库字段（③ 存储层 `public.skills` + `skill_versions`）
+## A.3 DB Persistence Fields (③ the storage layer's `public.skills` + `skill_versions`)
 
 ### `public.skills`
 
-| 列 | 类型 | 来源 | 说明 |
+| Column | Type | Source | Description |
 |---|---|---|---|
-| `slug` | text **PK** | NDJSON.slug | 主键 / diff / 去重 |
-| `title` | text | NDJSON.title | = API name 展示名 |
-| `description` | text | NDJSON.description | fallback 后描述 |
-| `description_zh` | text | metadata | 中文描述 |
-| `category` | text | metadata | + 索引 `idx_skills_category` |
-| `tags` | jsonb | metadata | 默认 `[]` |
-| `downloads` / `installs` / `stars` | integer | metadata | `downloads` 建降序索引 |
-| `version` | text | metadata | **更新信号** |
-| `source` | text | metadata | 社区 / 企业等 |
+| `slug` | text **PK** | NDJSON.slug | Primary key / diff / dedup |
+| `title` | text | NDJSON.title | = API name display name |
+| `description` | text | NDJSON.description | Description after fallback |
+| `description_zh` | text | metadata | Chinese description |
+| `category` | text | metadata | + index `idx_skills_category` |
+| `tags` | jsonb | metadata | Default `[]` |
+| `downloads` / `installs` / `stars` | integer | metadata | `downloads` has a descending index |
+| `version` | text | metadata | **Change signal** |
+| `source` | text | metadata | Community / enterprise, etc. |
 | `author` | text | metadata | — |
-| `requires_api_key` | boolean | metadata | 进哪个分发包；+ 索引 |
-| `has_package` | boolean | probe | 302/200 = 有包 |
+| `requires_api_key` | boolean | metadata | Which distribution package it goes into; + index |
+| `has_package` | boolean | probe | 302/200 = has a package |
 | `icon_url` / `homepage` | text | metadata | — |
-| `is_active` | boolean | sync 派生 | **软删**：下架 = false（不物删）；+ 索引 |
-| `first_seen_at` / `updated_at` | timestamptz | 入库派生 | — |
-| `body` | text | `SKILL.md` 正文 | 彻底版（约 97% 已回填） |
-| `embedding` | **vector(2048)** | 多模态 embedding | 彻底版；检索经 `::halfvec(2048)` + IVFFlat `halfvec_cosine_ops` 索引 |
-| `storage_path` | text | Storage 上传 | `skills/<slug>.zip` |
-| `enriched_at` | timestamptz | 回填派生 | 上次回填 body/向量/包时间 |
+| `is_active` | boolean | Derived from sync | **Soft-delete**: delisted = false (no hard delete); + index |
+| `first_seen_at` / `updated_at` | timestamptz | Derived on insertion | — |
+| `body` | text | `SKILL.md` body | Full version (~97% backfilled) |
+| `embedding` | **vector(2048)** | multimodal embedding | Full version; retrieval goes through `::halfvec(2048)` + IVFFlat `halfvec_cosine_ops` index |
+| `storage_path` | text | Storage upload | `skills/<slug>.zip` |
+| `enriched_at` | timestamptz | Derived from backfill | Time of last body/vector/package backfill |
 
-### `public.skill_versions`（版本史）
+### `public.skill_versions` (version history)
 
-| 列 | 类型 | 说明 |
+| Column | Type | Description |
 |---|---|---|
 | `id` | bigserial PK | — |
 | `slug` | text FK→skills | `on delete cascade` |
 | `version` | text | — |
 | `seen_at` | timestamptz | — |
-| — | `unique(slug, version)` | `updated` 态追加新版本，留版本史 |
+| — | `unique(slug, version)` | The `updated` state appends a new version, preserving version history |
 
 ---
 
-## 字段在三阶段的演变小结
+## Summary of Field Evolution Across the Three Stages
 
 ```
-API 原始              清洗 NDJSON               DB 落库
-─────────             ───────────               ───────
-name           ──►    title (带 fallback)  ──►  title
+Raw API               Cleaned NDJSON            DB Persistence
+─────────             ───────────               ──────────────
+name           ──►    title (with fallback)──►  title
 labels.requires_api_key
   "true"(str)  ──►    requires_api_key(bool) ─► requires_api_key
-（无）          ──►    body (SKILL.md 正文)  ──► body
-（无）          ──►    （无）                 ──► embedding vector(2048)
-（无）          ──►    （无）                 ──► storage_path
-version        ──►    version              ──►  version  +  skill_versions(版本史)
-updated_at(脏) ──►    （丢弃，不作变更依据）  ──► （不用）
+(none)         ──►    body (SKILL.md body) ──►  body
+(none)         ──►    (none)                ──► embedding vector(2048)
+(none)         ──►    (none)                ──► storage_path
+version        ──►    version              ──►  version  +  skill_versions(history)
+updated_at(dirty)──►  (dropped, not a change basis)──► (unused)
 ```

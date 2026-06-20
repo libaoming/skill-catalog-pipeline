@@ -1,104 +1,105 @@
 # skill-catalog-pipeline
 
-> 🌏 [English](README.en.md) | **中文**
+> 🌏 **English** | [中文](README.zh-CN.md)
 
-> 一套把「海量第三方技能包」做成**可语义检索、可装载**的技能库底座的工程方案：
-> 抓取 → 清洗规范化 → 向量入库 → 语义检索 → 自动同步，外加一份把坑全踩过一遍的工程结晶。
+> An engineering blueprint for turning a **massive pile of third-party skill packs** into a **semantically searchable, loadable** skill catalog foundation:
+> fetch → clean & normalize → vectorize & ingest → semantic search → auto-sync, plus a hard-won writeup of every trap we hit along the way.
 >
-> 讲的是「7.7 万条技能怎么变成一个 500ms 能语义检索的库」的完整方法论与踩坑，并附**脱敏参考实现**（[`src/`](src/)，16 个脚本 + SQL，凭证与数据源 host 全走环境变量、非开箱即跑）。
+> It covers the full methodology and pitfalls of "how 77K skills become a library you can semantically search in 500ms," and ships a **redacted reference implementation** ([`src/`](src/), 16 scripts + SQL; credentials and the data-source host all come from environment variables — not run-out-of-the-box).
 
 ---
 
-## 为什么需要这个
+## Why this exists
 
-AI 员工 / Agent 产品要让 agent「能动手」，就得给它挂一层**可检索、可装载的能力**（tools / skills）。
+For AI-employee / Agent products to let an agent "actually do things," you need to give it a layer of **searchable, loadable capabilities** (tools / skills).
 
-好消息是：开源生态里已经有海量 **Claude Code 风格的 `SKILL.md` 技能**——一个技能 = 一段 frontmatter 元数据 + 一篇自然语言指令正文 + 可选 `scripts/` 脚本。某个公开技能市场就有 **77,000+** 条，是现成的能力供给池。
+The good news: the open-source ecosystem already has a massive supply of **Claude Code-style `SKILL.md` skills** — a skill = a chunk of frontmatter metadata + a natural-language instruction body + an optional `scripts/` directory. A certain public skill market alone hosts **77,000+** of them, a ready-made pool of capability supply.
 
-坏消息是：它只给你一个分页 API。要把它变成产品 runtime 能用的底座，你得自己解决：
+The bad news: it only hands you a paginated API. To turn that into a foundation your product runtime can actually use, you have to solve everything yourself:
 
-- 怎么**完整抓全**（API 分页一抖动就漏上千条，漏的会被误判成「下架」）？
-- 怎么**清洗规范化**（7 成分类为空、字段口径混乱、脏数据带 NUL 字节）？
-- 怎么**做语义检索**（2048 维向量超了 pgvector 的上限，索引还建不出来）？
-- 怎么**持续同步**（平台的 `updated_at` 是脏信号，天天都在「更新」）？
+- How do you **fetch the whole thing completely** (a single hiccup in API pagination drops thousands of entries, and the dropped ones get misread as "delisted")?
+- How do you **clean and normalize** (70% of categories are empty, field semantics are inconsistent, dirty data carries NUL bytes)?
+- How do you **do semantic search** (2048-dim vectors blow past pgvector's ceiling, and the index won't even build)?
+- How do you **keep it in sync** (the platform's `updated_at` is a dirty signal — everything is "updated" every single day)?
 
-这份文档把这四件事从头到尾讲清楚，并把每个坑的**现象 → 根因 → 结论**沉淀下来。
+This document walks through all four end to end, and distills every trap into a **symptom → root cause → conclusion** entry.
 
 ---
 
-## 五层管线
+## The five-stage pipeline
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  数据源：某公开技能市场 REST API（无鉴权，~77,000 条）          │
+│  Data source: a public third-party skill-market REST API       │
+│               (no auth, ~77,000 entries)                       │
 └───────────────┬──────────────────────────────────────────────┘
                 │
-   ① 抓取 FETCH        list → probe → build
-   │                   多轮并集对抗分页抖动 + 完整性闸门
-   ▼                   产物：_full_raw.jsonl / all-skills/
+   ① FETCH             list → probe → build
+   │                   multi-pass union vs. pagination jitter + completeness gate
+   ▼                   output: _full_raw.jsonl / all-skills/
    │
-   ② 清洗 NORMALIZE    scan → validate(5 硬条件) → import → package
-   │                   dry-run 不写库，同快照重跑逐字节一致
-   ▼                   产物：skills.ndjson（含 body 全文）
+   ② NORMALIZE         scan → validate(5 hard conditions) → import → package
+   │                   dry-run writes nothing; rerun on same snapshot is byte-for-byte identical
+   ▼                   output: skills.ndjson (full body text included)
    │
-   ③ 存储 STORAGE      Postgres + pgvector + 对象存储
-   │                   元数据 upsert / embedding 64 并发灌入 / zip 上传 / RLS 只读
-   ▼                   终态：四态资产齐（元数据 + 正文 + 向量 + zip）
+   ③ STORAGE           Postgres + pgvector + object storage
+   │                   metadata upsert / embedding ingest at 64 concurrency / zip upload / read-only RLS
+   ▼                   end state: all four asset states present (metadata + body + vector + zip)
    │
-   ④ 检索 RETRIEVAL    query → embed → halfvec 余弦最近邻
-   │                   带 IVFFlat 索引 ~500ms/查询（无索引 130s，提速 ~260×）
+   ④ RETRIEVAL         query → embed → halfvec cosine nearest-neighbor
+   │                   ~500ms/query with IVFFlat index (130s without, ~260× speedup)
    ▼
-   ⑤ 同步 SYNC ────────┘  每周自动 diff 四态（new/updated/removed/stats_only）
-                          认 version 不认 updated_at；双闸门防残缺快照滚基准
+   ⑤ SYNC ─────────────┘  weekly auto-diff across four states (new/updated/removed/stats_only)
+                          trusts version, not updated_at; dual gates keep partial snapshots from rolling the baseline
 ```
 
-**人 / 机分工**：抓取 / 清洗 / 灌库 / 检索 / 周度 diff 全自动且幂等可断点续跑；**建向量索引**（走服务端 SQL Editor）、**内容层入库**、**凭证轮换**、**生产 DB 杀进程**这几步锚在人手上。
+**Human / machine split**: fetch / normalize / ingest / search / weekly diff are all fully automated, idempotent, and resumable from a checkpoint; **building the vector index** (via the server-side SQL Editor), **content-layer ingestion**, **credential rotation**, and **killing a process on the production DB** are the steps that stay anchored to a human.
 
 ---
 
-## 工程结晶速查（最贵的几条）
+## Engineering-notes quick reference (the most expensive ones)
 
-完整 17 条见 **[docs/engineering-notes.md](docs/engineering-notes.md)**，这里挑最容易踩、代价最大的：
+The full 17 entries live in **[docs/engineering-notes.md](docs/engineering-notes.md)**; here are the easiest to hit and the costliest:
 
-| # | 坑 | 结论 |
+| # | Trap | Conclusion |
 |---|---|---|
-| ⭐ | embedding 2048 维建不了索引 | 超 pgvector `vector` 全精度 2000 上限 → 用 **`halfvec` 半精度 + IVFFlat 表达式索引**，查询两侧也要 cast |
-| ⭐⭐ | 本地建索引必断连（`SSL SYSCALL error: EOF`） | 本地代理按时长砍多分钟空闲长连接 → **建索引走托管控制台 SQL Editor 服务端跑** |
-| ⭐ | 批量写库反复死 | 别持长命连接 → **临时连接 `db_once` + 重连重试**，或 keepalive + 有限 timeout |
-| ⭐ | 每条技能天天「更新」 | `updated_at` 是脏信号（随 downloads 刷新）→ 变更**只认 `version`** |
-| ⭐ | 单轮抓全量漏上千条 | API 分页抖动 ±1000+ → **多轮并集 + 完整性闸门**，残缺快照绝不滚基准 |
-| ⭐⭐ | 全 DB 写入都卡、连接超时 | 残留 `CREATE INDEX` 进程持表锁 13h → 先查 `pg_stat_activity` 找 active 老查询 |
+| ⭐ | 2048-dim embedding can't build an index | exceeds pgvector `vector`'s full-precision ceiling of 2000 → use **`halfvec` half-precision + an IVFFlat expression index**, and cast on both query sides too |
+| ⭐⭐ | local index builds always drop the connection (`SSL SYSCALL error: EOF`) | the local proxy kills multi-minute idle long-lived connections by duration → **build the index server-side via the managed console SQL Editor** |
+| ⭐ | bulk DB writes keep dying | don't hold long-lived connections → **ephemeral `db_once` connection + reconnect-retry**, or keepalive + bounded timeout |
+| ⭐ | every skill is "updated" every day | `updated_at` is a dirty signal (refreshes with downloads) → trust **`version` only** for change detection |
+| ⭐ | a single fetch pass drops thousands | API pagination jitters by ±1000+ → **multi-pass union + completeness gate**; a partial snapshot never rolls the baseline |
+| ⭐⭐ | all DB writes stall, connections time out | a leftover `CREATE INDEX` process held a table lock for 13h → check `pg_stat_activity` first for active long-running queries |
 
-> 一句话：这套管线真正难的不是画五层架构，而是**真数据跑出来才现形**的这些坑。
+> In one line: the hard part of this pipeline isn't drawing a five-stage architecture — it's these traps that **only surface once real data flows through**.
 
 ---
 
-## 文档导航
+## Documentation map
 
-| 文档 | 内容 |
+| Document | Contents |
 |---|---|
-| **[docs/architecture.md](docs/architecture.md)** | 脱敏完整方案：五层管线逐层展开 + 总体架构图 + 建表 / 索引 / 检索 SQL |
-| **[docs/engineering-notes.md](docs/engineering-notes.md)** | ⭐ 工程结晶：17 条踩坑复盘（现象 → 根因 → 结论），本仓库最高价值 |
-| **[docs/field-dictionary.md](docs/field-dictionary.md)** | 字段字典：抓取 → 清洗 → 落库三套口径，及字段演变小结 |
-| **[src/](src/)** | 脱敏参考实现：`fetch/` `normalize/` `storage/` `retrieval/` `sync/` 五层脚本 + SQL，见 [src/README.md](src/README.md) |
+| **[docs/architecture.md](docs/architecture.md)** | Full redacted blueprint: each of the five stages unpacked + overall architecture diagram + table / index / retrieval SQL |
+| **[docs/engineering-notes.md](docs/engineering-notes.md)** | ⭐ Engineering notes: 17 post-mortem entries (symptom → root cause → conclusion), the highest-value content in this repo |
+| **[docs/field-dictionary.md](docs/field-dictionary.md)** | Field dictionary: three sets of semantics across fetch → clean → persist, plus a summary of how fields evolved |
+| **[src/](src/)** | Redacted reference implementation: `fetch/` `normalize/` `storage/` `retrieval/` `sync/` — five layers of scripts + SQL, see [src/README.md](src/README.md) |
 
 ---
 
-## 适合谁读
+## Who should read this
 
-- 在做 **RAG / 向量检索**，被高维 embedding、pgvector 上限、索引构建坑过的人
-- 在给 **Agent 挂技能 / 工具层**，需要把外部能力池工程化成可检索底座的人
-- 在做**大规模数据管线**（抓取 → 清洗 → 入库 → 同步），跟分页抖动、断连、幂等续跑搏斗的人
-- 想看一个**真·踩坑复盘**而不是 happy-path tutorial 的人
+- Anyone doing **RAG / vector search** who's been burned by high-dimensional embeddings, pgvector ceilings, and index construction
+- Anyone giving an **Agent a skill / tool layer** who needs to engineer an external capability pool into a searchable foundation
+- Anyone building a **large-scale data pipeline** (fetch → clean → ingest → sync) and wrestling with pagination jitter, dropped connections, and idempotent resumption
+- Anyone who wants a **real post-mortem** rather than a happy-path tutorial
 
 ---
 
-## 说明
+## Notes
 
-- 本仓库**不含任何真实技能数据**——数据源是第三方公开服务，原始数据归其所有；抓取 host 需自行通过环境变量配置。
-- `src/` 是**脱敏参考实现**：凭证与数据源 host 全走环境变量，依赖外部服务（数据源 API、Postgres+pgvector、对象存储、embedding 服务），**非开箱即跑**，仅供理解管线和改造参考。
-- 文档中 SQL / 代码片段为**示意性**，凭证一律用占位符（`<...>` / `${...}`），实际使用请填自己的环境。
-- 案例脱胎于一个 AI 员工 / Agent 市场产品的真实工程实践，已做匿名化处理。
+- This repo contains **no real skill data** — the data source is a third-party public service, the raw data belongs to it, and the fetch host must be configured by you via an environment variable.
+- `src/` is a **redacted reference implementation**: credentials and the data-source host all come from environment variables, it depends on external services (the data-source API, Postgres+pgvector, object storage, an embedding service), and it is **not run-out-of-the-box** — it's only for understanding the pipeline and as a basis for adaptation.
+- SQL / code snippets in the docs are **illustrative**; credentials are always placeholders (`<...>` / `${...}`) — fill in your own environment for real use.
+- The case study grew out of the real engineering practice behind an AI-employee / Agent marketplace product, and has been anonymized.
 
 ---
 

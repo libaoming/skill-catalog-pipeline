@@ -1,147 +1,147 @@
-# 工程结晶 — 把 7.7 万条技能做成可检索库踩过的坑
+# Engineering Crystallization — Lessons from Turning 77K Skills into a Searchable Library
 
-> 🌏 [English](engineering-notes.en.md) | **中文**
+> 🌏 **English** | [中文](engineering-notes.zh-CN.md)
 
-> 这是本仓库**最高价值**的一篇。架构图谁都画得出，真正贵的是下面这些「跑了真数据才现形」的坑。
-> 每条：**现象 → 根因 → 结论**。带 ⭐ 的是最容易踩、代价最大的。
+> This is the **highest-value** document in the repo. Anyone can draw an architecture diagram; what's actually expensive are the pitfalls below that only surfaced once we ran against real data.
+> Each entry: **Symptom → Root cause → Takeaway**. The ⭐ ones are the easiest to hit and the most costly.
 
 ---
 
-## 一、向量检索
+## I. Vector Search
 
-### ⭐ 1. 2048 维超 pgvector 全精度 `vector` 上限 2000
+### ⭐ 1. 2048 dimensions exceed pgvector's full-precision `vector` cap of 2000
 
-- **现象**：embedding 维度 2048，建 `hnsw (embedding vector_cosine_ops)` 索引直接报错。
-- **根因**：pgvector 的 HNSW / IVFFlat 对全精度 `vector` 类型有 **2000 维上限**。
-- **结论**：用 **`halfvec` 半精度**（上限 4000，精度损失对排序基本无感）。索引建在表达式上，**查询两侧也要 cast** 才能命中：
+- **Symptom**: With an embedding dimension of 2048, building an `hnsw (embedding vector_cosine_ops)` index errors out immediately.
+- **Root cause**: pgvector's HNSW / IVFFlat have a **2000-dimension cap** on the full-precision `vector` type.
+- **Takeaway**: Use **`halfvec` half precision** (cap of 4000; the precision loss is essentially imperceptible for ranking). The index is built on an expression, and **both sides of the query must also be cast** for it to be used:
 
 ```sql
--- 建索引
+-- Build the index
 create index idx_skills_embedding_ivf on public.skills
   using ivfflat ((embedding::halfvec(2048)) halfvec_cosine_ops) with (lists = 200);
 
--- 查询（两侧都 cast，否则不走索引）
+-- Query (cast on both sides, otherwise the index is not used)
 order by embedding::halfvec(2048) <=> :qvec::halfvec(2048)
 ```
 
-> 选 IVFFlat 不选 HNSW：HNSW 在小实例上建索引耗内存更高、更易被资源墙掐。
+> Choosing IVFFlat over HNSW: on a small instance, HNSW index builds consume more memory and are more likely to be cut off by resource limits.
 
-### ⭐⭐ 2. 本地建向量索引必断连（最坑的一条）
+### ⭐⭐ 2. Building a vector index locally always drops the connection (the nastiest one)
 
-- **现象**：本地脚本建索引，等几分钟后必报 `SSL SYSCALL error: EOF detected`；服务端日志**无 OOM / FATAL**（排除了服务端问题）。
-- **根因**：本地代理（如 Clash，把 DB 连到 fake-IP `198.18.x.x`）会**按时长砍多分钟空闲长连接**，TCP keepalive 无效。灌数据 / 查询时连接上有数据流能活着，但建索引是「纯等待几分钟」，必被砍。
-- **结论**：**建向量索引一律走数据库托管控制台的 SQL Editor（服务端执行）**，绕开本地连接，一次成功。备选 = 给代理对数据库 host 设直连。
+- **Symptom**: Running an index build from a local script, after a few minutes it always fails with `SSL SYSCALL error: EOF detected`; the server logs show **no OOM / FATAL** (which rules out a server-side problem).
+- **Root cause**: A local proxy (e.g. Clash, which maps the DB to a fake-IP `198.18.x.x`) **kills multi-minute idle long connections by duration**, and TCP keepalive is ineffective. During data loading / querying there's a data stream on the connection so it stays alive, but an index build is "just waiting for several minutes," so it always gets killed.
+- **Takeaway**: **Always build vector indexes via the managed database console's SQL Editor (executed server-side)**, bypassing the local connection — succeeds in one shot. Alternative: configure the proxy to connect directly to the database host.
 
-### 3. 建索引的资源墙
+### 3. The resource wall when building indexes
 
-- **现象**：服务端建索引被 `statement_timeout` 掐；或并行 worker 在 `/dev/shm` 开段导致 `DiskFull`。
-- **结论**：建前两件套：
+- **Symptom**: A server-side index build is cut off by `statement_timeout`; or parallel workers allocating segments in `/dev/shm` cause `DiskFull`.
+- **Takeaway**: Set up two things before building:
 
 ```sql
-set statement_timeout = '30min';            -- 别让超时掐掉
-set max_parallel_maintenance_workers = 0;   -- 串行，避开并行 worker 撑爆 /dev/shm
+set statement_timeout = '30min';            -- don't let the timeout cut it off
+set max_parallel_maintenance_workers = 0;   -- serial, to avoid parallel workers blowing up /dev/shm
 ```
 
 ---
 
-## 二、数据库连接与批量写
+## II. Database Connections and Batch Writes
 
-### ⭐ 4. 批量写库别持长命连接
+### ⭐ 4. Don't hold a long-lived connection for batch writes
 
-- **现象**：storage 上传 / enrich 在负载下反复死。持一个长连接贯穿整个上传循环，每 chunk 几十秒的网络间隙里连接空闲被代理砍，随后 `rollback()` 在死连接上抛 `InterfaceError` 把整个 job 带崩。
-- **结论**：两种活法二选一——
-  1. **临时连接 `db_once`**：上传阶段完全不持 DB 连接；每 chunk 上传完才临时开连接做 UPDATE → commit → **立即关**，连接只活几秒永不空闲；对连接死亡重连重试 4 次（指数退避）。
-  2. **keepalive + 有限 timeout**：连接建立后 `set statement_timeout='10min'`（不设 0，0 会让撞锁的 UPDATE 无限挂）、`set lock_timeout='30s'`、TCP `keepalives_idle=10s`。
+- **Symptom**: storage upload / enrich kept dying under load. A single long connection was held across the entire upload loop; during each chunk's tens-of-seconds network gap the connection sat idle and got killed by the proxy, after which `rollback()` on the dead connection threw `InterfaceError` and crashed the whole job.
+- **Takeaway**: Two ways to survive — pick one:
+  1. **Ephemeral connection `db_once`**: hold no DB connection at all during the upload phase; only after each chunk finishes uploading do you briefly open a connection to do the UPDATE → commit → **close immediately**, so the connection lives only a few seconds and is never idle; retry up to 4 times on connection death (exponential backoff).
+  2. **keepalive + bounded timeout**: after establishing the connection, set `statement_timeout='10min'` (don't set 0; 0 lets a lock-contending UPDATE hang forever), `lock_timeout='30s'`, and TCP `keepalives_idle=10s`.
 
-### 5. 大字段查询会超时
+### 5. Querying large fields times out
 
-- **现象**：`select` 带 `body` 大字段全表查，statement 超时。
-- **结论**：DB 只查 `slug`（轻），`body` 从本地文件读。需要 embedding 的行只查 `embedding is null and body is not null`，不拉大字段。
+- **Symptom**: A full-table `select` that pulls the large `body` field times out at the statement level.
+- **Takeaway**: Query only `slug` (lightweight) from the DB, and read `body` from local files. For rows that need embedding, query only `embedding is null and body is not null`, without pulling the large field.
 
-### 6. 脏数据里的 NUL 字节
+### 6. NUL bytes in dirty data
 
-- **现象**：某技能字段含 `NUL`（`0x00`），整批 upsert 被 PG 拒收。
-- **结论**：入库前递归 `_clean` 去 NUL（PG text/jsonb 不收 `0x00`）。
+- **Symptom**: A skill field contained `NUL` (`0x00`), and the entire batch upsert was rejected by PG.
+- **Takeaway**: Recursively `_clean` to strip NUL before insertion (PG text/jsonb does not accept `0x00`).
 
-### ⭐⭐ 7. 残留 CREATE INDEX 进程持表锁拖垮全 DB
+### ⭐⭐ 7. A leftover CREATE INDEX process holding a table lock drags down the entire DB
 
-- **现象**：所有 UPDATE（批量写）全堵死、连接池占满 `ECHECKOUTTIMEOUT`、控制台报「exhausting multiple resources」、连 SQL Editor 自己都连接超时。
-- **根因**：上个 session 一个 `create index ... hnsw` 进程 **active 卡死 13 小时**仍持 `skills` 表锁。
-- **结论**：**任何「全 DB 写入都卡 / 连接超时」先查 `pg_stat_activity` 找 active 老查询持锁**（用走管理通道、不占 Session pool 的途径查）。`CREATE INDEX` 会卡数小时，普通 UPDATE 被 kill 后也会 IO-bound 残留把 DB 压住。
+- **Symptom**: All UPDATEs (batch writes) are blocked, the connection pool fills up with `ECHECKOUTTIMEOUT`, the console reports "exhausting multiple resources," and even the SQL Editor itself times out on connect.
+- **Root cause**: A `create index ... hnsw` process from a previous session was **stuck active for 13 hours** and still held the lock on the `skills` table.
+- **Takeaway**: **Whenever "all DB writes are blocked / connections time out," first check `pg_stat_activity` for an old active query holding a lock** (query it via a path that goes through the management channel and doesn't occupy the Session pool). `CREATE INDEX` can block for hours, and even an ordinary UPDATE, after being killed, can leave an IO-bound remnant that keeps the DB pinned.
 
-### 8. 别杀健康的批量任务
+### 8. Don't kill a healthy batch job
 
-- **现象**：为提速去 `pkill` 正在跑的批量写库任务，结果更糟。
-- **根因**：杀在写库的 ~3s 窗口会留 IO-bound 残留 UPDATE（服务端继续跑，会话池不随客户端死而停），把 DB 又压住、池又满。
-- **结论**：要停先让它跑完一个 chunk 的 commit 间隙。批量任务本就幂等可断点续跑，**慢但稳**。杀生产 backend（`pg_terminate_backend`）应由 owner 在 SQL Editor 亲跑（共享生产 DB 杀进程要谨慎）。
-
----
-
-## 三、数据抓取与同步
-
-### ⭐ 9. 变更信号认 `version` 不认 `updated_at`
-
-- **现象**：`updated_at` 跟随 downloads 每次同步刷新，每条技能天天「更新」。
-- **根因**：平台的 `updated_at` 是脏信号，无法区分「内容更新」vs「下载量涨」。
-- **结论**：diff 的变更信号**只认 `version`**。守坑 case：「updated_at 变但 version 不变 + downloads 变 → 必判 stats_only（只更统计、不重下）」。
-  > 一句话总结：**没有验证机制的目标只是许愿**——拿真数据一跑，脏信号立刻现形。
-
-### ⭐ 10. API 分页抖动 → 多轮并集 + 完整性闸门
-
-- **现象**：同一时刻三次抓全量，返回数量波动 ±1000+。单轮抓必漏，漏掉的会被 diff 误判成「下架」，下架噪音上万条。
-- **结论**：三层防御——失败页重试 ×3 轮；整轮抓完取 slug 并集，未达 total 99.5% 就整轮重抓并入并集直到收敛；最终 < total 98% 直接抛错，**残缺快照绝不滚成基准**。下架噪音从上万收敛到几十（≈ 0.06%，API 固有波动）。
-
-### 11. 软删不物删
-
-- **结论**：技能下架标 `is_active=false`，不物理删除。配合 RLS 的 `using(is_active)`，下架技能对公开读不可见，但版本史和 slug 仍在，便于回溯和复活。
+- **Symptom**: To speed things up, we `pkill`'d a running batch-write job, which made things worse.
+- **Root cause**: Killing within the ~3s window of a write leaves an IO-bound remnant UPDATE (the server keeps running it; the session pool does not stop just because the client died), which pins the DB again and refills the pool.
+- **Takeaway**: To stop it, let it finish the commit gap of a chunk first. Batch jobs are inherently idempotent and resumable from a checkpoint — **slow but steady**. Killing a production backend (`pg_terminate_backend`) should be done by the owner directly in the SQL Editor (be cautious killing processes on a shared production DB).
 
 ---
 
-## 四、Embedding 与对象存储
+## III. Data Fetching and Sync
 
-### 12. 多模态 embedding 的三个硬约束
+### ⭐ 9. Trust `version` as the change signal, not `updated_at`
 
-- **model 名直调 404** → 必须先建推理接入点，用 endpoint-id 调。
-- **多模态一次融合成 1 向量** → 每条单请求，不能批量塞多文本。
-- 维度 **2048**（正是它触发了第 1 条的 pgvector 上限坑）。
+- **Symptom**: `updated_at` is refreshed alongside downloads on every sync, so every skill looks "updated" every day.
+- **Root cause**: The source's `updated_at` is a dirty signal — it can't distinguish "content updated" from "download count went up."
+- **Takeaway**: The diff's change signal **trusts only `version`**. Guard case: "`updated_at` changed but `version` didn't + downloads changed → must be judged stats_only (update stats only, don't re-download)."
+  > In one line: **a target without a verification mechanism is just a wish** — run it against real data and the dirty signal surfaces instantly.
 
-### 13. Storage 上传缺 header 就 400
+### ⭐ 10. API pagination jitter → multi-round union + completeness gate
 
-- **现象**：上传对象存储返 400。
-- **结论**：header 必带 `apikey` + `Authorization: Bearer <service_key>` + `x-upsert:true`（缺 apikey 直接 400）；写权限必须 service_role / secret key，anon 不行。
+- **Symptom**: Three full crawls at the same moment return counts that swing by ±1000+. A single-round crawl is bound to miss items, and the missed ones get misjudged by the diff as "delisted," producing tens of thousands of delisting noise entries.
+- **Takeaway**: Three layers of defense — retry failed pages ×3 rounds; after each full round take the union of slugs, and if it hasn't reached 99.5% of total, re-crawl the whole round and merge into the union until it converges; if the final count is < 98% of total, throw an error outright — **an incomplete snapshot must never be rolled into the baseline**. Delisting noise converged from tens of thousands down to a few dozen (≈ 0.06%, the API's inherent jitter).
 
-### 14. 串行上传太慢 → 64 并发
+### 11. Soft-delete, not hard-delete
 
-- **现象**：7.5 万条串行 PUT 要数小时。
-- **结论**：照 embed 范式做独立 64 并发加速版（`ThreadPoolExecutor`），配合第 4 条的 `db_once` 抗断连，一口气跑完。
-
----
-
-## 五、平台与协作
-
-### 15. 托管 DB 的 MCP 只读，写要直连
-
-- **结论**：托管数据库的 MCP 工具多是只读模式，建表 / 写必须用 DB 直连凭证（MCP 的 migration / execute 写操作会被拒）。但**查 `pg_stat_activity` 这类诊断走 MCP 管理通道更好**——不占 Session pool（见第 7 条）。
-
-### 16. Session pooler 长连接会被掐
-
-- **结论**：免费 IPv4 Session pooler 下长任务连接可能被掐断 → 脚本每批 commit + 幂等续跑 + 自动重跑包装兜底。这是「为什么所有批量脚本都要幂等」的根因之一。
-
-### 17. 凭证管理纪律
-
-- **现象**：早期把凭证写 `.env` 被安全分类器拦。
-- **结论**：凭证一律从环境变量 / `.env` 读（环境变量优先），脚本里只留占位符；上线前轮换；`.env` 进 `.gitignore`，**绝不进仓库**。
+- **Takeaway**: A delisted skill is marked `is_active=false` rather than physically deleted. Combined with RLS's `using(is_active)`, a delisted skill is invisible to public reads, but its version history and slug remain, making it easy to trace back and revive.
 
 ---
 
-## 一句话收口
+## IV. Embedding and Object Storage
 
-这套管线真正难的不是「画五层架构」，而是：
+### 12. Three hard constraints of multimodal embedding
 
-1. **维度超限**逼你从 `vector` 换 `halfvec` + 表达式索引；
-2. **本地代理砍空闲连接**逼你把建索引挪到服务端、把批量写改成临时连接；
-3. **脏的 `updated_at`** 逼你只认 `version` 做变更信号；
-4. **API 分页抖动**逼你做多轮并集 + 完整性闸门；
-5. **残留索引锁**逼你养成「先查 `pg_stat_activity`」的肌肉记忆。
+- **Calling by model name directly returns 404** → you must first create an inference endpoint and call it by endpoint-id.
+- **Multimodal fuses into 1 vector per request** → one request per item; you can't batch-stuff multiple texts.
+- Dimension is **2048** (exactly what triggered the pgvector cap in entry 1).
 
-每一条都是真数据跑出来的，不是设计阶段想得到的。
+### 13. Storage upload returns 400 if a header is missing
+
+- **Symptom**: Uploading to object storage returns 400.
+- **Takeaway**: Headers must include `apikey` + `Authorization: Bearer <service_key>` + `x-upsert:true` (a missing apikey is an immediate 400); write permission requires the service_role / secret key — anon won't work.
+
+### 14. Serial upload is too slow → 64-way concurrency
+
+- **Symptom**: 75K serial PUTs would take hours.
+- **Takeaway**: Build an independent 64-way concurrent accelerated version following the embed pattern (`ThreadPoolExecutor`), paired with entry 4's `db_once` to withstand connection drops, and run it all in one go.
+
+---
+
+## V. Platform and Collaboration
+
+### 15. The managed DB's MCP is read-only; writes need a direct connection
+
+- **Takeaway**: A managed database's MCP tools are mostly read-only; creating tables / writing must use direct DB connection credentials (MCP's migration / execute write operations get rejected). However, **diagnostics like querying `pg_stat_activity` are better done via the MCP management channel** — it doesn't occupy the Session pool (see entry 7).
+
+### 16. Session pooler long connections get cut off
+
+- **Takeaway**: Under a free IPv4 Session pooler, long-running task connections may be cut off → scripts commit per batch + resume idempotently + wrap with an auto-rerun fallback. This is one of the root reasons "why all batch scripts must be idempotent."
+
+### 17. Credential management discipline
+
+- **Symptom**: Early on, writing credentials into `.env` was flagged by a security classifier.
+- **Takeaway**: Always read credentials from environment variables / `.env` (environment variables take priority), keeping only placeholders in scripts; rotate before going live; put `.env` in `.gitignore` — **it must never enter the repo**.
+
+---
+
+## One-line Wrap-up
+
+What's actually hard about this pipeline isn't "drawing a five-layer architecture," it's:
+
+1. **Dimension over the cap** forced the switch from `vector` to `halfvec` + an expression index;
+2. **The local proxy killing idle connections** forced moving index builds to the server side and rewriting batch writes to use ephemeral connections;
+3. **The dirty `updated_at`** forced trusting only `version` as the change signal;
+4. **API pagination jitter** forced a multi-round union + completeness gate;
+5. **A leftover index lock** forced building the muscle memory of "check `pg_stat_activity` first."
+
+Every one of these came out of running real data — none were foreseeable at the design stage.
