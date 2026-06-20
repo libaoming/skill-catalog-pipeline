@@ -1,5 +1,7 @@
 # 技能库工程方案 — 抓取 · 清洗 · 存储 · 检索 · 同步
 
+> 🌏 [English](architecture.en.md) | **中文**
+
 > 把海量第三方技能包做成「可语义检索、可装载」的技能库底座的完整工程方案。
 > 数据规模：~77,000 条 Claude Code 风格 SKILL.md 技能。
 
@@ -226,7 +228,7 @@ set lock_timeout      = '30s'     # 撞残留行锁快速失败，不挂死
 
 **多模态 embedding 的硬约束（踩坑结晶）**：
 
-- ⚠️ **model 名直调 404 → 必须建推理接入点用 endpoint-id**（占位 `${ARK_EMBED_MODEL}`）。
+- ⚠️ **model 名直调 404 → 必须建推理接入点用 endpoint-id**（占位 `${EMBED_MODEL}`）。
 - 端点 `/api/v3/embeddings/multimodal`，input = `[{type:text, text}]`，**多模态一次融合成 1 向量 → 每条单请求，不能批量塞多文本**。
 - 维度 **2048**。
 
