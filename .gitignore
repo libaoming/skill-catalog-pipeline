@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*~
+
+# 凭证 / 环境（本仓库纯文档，不应出现，但留作护栏）
+.env
+.env.*
+*.key
+*.pem
+
+# 临时
+*.log
+__pycache__/
+.venv/
